@@ -1,0 +1,9 @@
+# 凭据与本地缓存，绝不入库
+config.json
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+Thumbs.db
+*.log
