@@ -41,6 +41,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
@@ -144,9 +145,12 @@ class WlanClient:
             except requests.RequestException:
                 continue
             final = r.url
-            m = re.search(r"[?&]nasId=([^&]+)", str(final))
+            m = re.search(r"[?&]nasId=([^&]+)", final or "")
             if m:
-                self.host = final.netloc
+                host = urlparse(final).netloc
+                if not host:
+                    continue
+                self.host = host
                 self.nas_id = m.group(1)
                 log.info("WLAN 门户: %s, nasId=%s (SSID=%s)", self.host, self.nas_id, get_ssid())
                 return True
@@ -336,12 +340,29 @@ def main() -> int:
     if args.watch:
         interval = max(30, args.watch)
         log.info("保活模式启动，检测间隔 %ss（Ctrl+C 退出）", interval)
+        fail_streak = 0
         while True:
-            if is_online_sure():
-                log.info("在线，无需登录")
-            else:
-                log.info("离线（二次确认），尝试登录 (%s) ...", args.net)
-                login_once(args.net, user, pwd)
+            try:
+                if is_online_sure():
+                    if fail_streak:
+                        log.info("网络已恢复（此前连续失败 %d 次）", fail_streak)
+                    fail_streak = 0
+                    log.info("在线，无需登录")
+                else:
+                    log.info("离线（二次确认），尝试登录 (%s) ...", args.net)
+                    ok = login_once(args.net, user, pwd)
+                    if ok:
+                        fail_streak = 0
+                        log.info("登录成功")
+                    else:
+                        fail_streak += 1
+                        log.warning("本次登录未成功（连续第 %d 次），%ds 后重试", fail_streak, interval)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:                       # noqa: BLE001 - 保活进程必须自愈
+                fail_streak += 1
+                log.error("保活循环异常（连续第 %d 次）：%s: %s", fail_streak, type(e).__name__, e)
+                log.debug("异常详情", exc_info=True)
             time.sleep(interval)
     else:
         if is_online():
@@ -355,4 +376,9 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
+        log.info("已停止")
         sys.exit(130)
+    except Exception as e:                               # noqa: BLE001
+        log.error("未捕获异常：%s: %s", type(e).__name__, e)
+        log.debug("异常详情", exc_info=True)
+        sys.exit(1)
