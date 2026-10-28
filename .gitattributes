@@ -1,0 +1,7 @@
+# Windows 批处理必须 CRLF，否则 goto 标签可能失效
+*.bat text eol=crlf
+*.cmd text eol=crlf
+# 源码统一 LF
+*.py text eol=lf
+*.md  text eol=lf
+*.json text eol=lf
