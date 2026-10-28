@@ -1,5 +1,6 @@
 # 凭据与本地缓存，绝不入库
 config.json
+python.local.txt
 __pycache__/
 *.pyc
 .venv/

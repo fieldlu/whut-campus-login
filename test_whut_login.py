@@ -16,6 +16,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import subprocess
 
@@ -338,6 +339,46 @@ class TestCredentials(unittest.TestCase):
         enc = "{B}" + base64.b64encode("secret".encode()).decode()
         self._write(json.dumps({"username": "a", "password": enc}))
         self.assertEqual(m.load_credentials(), ("a", "secret"))
+
+    def test_base64_both_fields(self):
+        u = "{B}" + base64.b64encode("stu0001".encode()).decode()
+        p = "{B}" + base64.b64encode("Sample.Pass.01.".encode()).decode()
+        self._write(json.dumps({"username": u, "password": p}))
+        self.assertEqual(m.load_credentials(), ("stu0001", "Sample.Pass.01."))
+
+    def test_mixed_plain_and_base64(self):
+        p = "{B}" + base64.b64encode("pw".encode()).decode()
+        self._write(json.dumps({"username": "abc", "password": p}))
+        self.assertEqual(m.load_credentials(), ("abc", "pw"))
+
+    def test_trailing_dot_preserved(self):
+        """密码结尾的点必须原样保留（曾被误当作可忽略字符）。"""
+        p = "{B}" + base64.b64encode("Pass.123.".encode()).decode()
+        self._write(json.dumps({"username": "a", "password": p}))
+        self.assertEqual(m.load_credentials()[1], "Pass.123.")
+
+    def test_broken_base64_username_exits(self):
+        self._write(json.dumps({"username": "{B}!!!not-base64!!!", "password": "b"}))
+        with self.assertRaises(SystemExit):
+            m.load_credentials()
+
+    def test_init_config_writes_encoded(self):
+        args = ("stu0001", "Sample.Pass.01.")
+
+        def fake_input(prompt=""):
+            return args[0] if "账号" in prompt else args[1]
+
+        with mock.patch("builtins.input", fake_input):
+            m.init_config()
+        raw = m.CONFIG_NAME.read_text(encoding="utf-8")
+        self.assertNotIn("stu0001", raw, "账号不应明文落盘")
+        self.assertNotIn("Sample", raw, "密码不应明文落盘")
+        self.assertEqual(m.load_credentials(), args)     # 写入后能原样读回
+
+    def test_init_config_rejects_empty(self):
+        with mock.patch("builtins.input", lambda prompt="": "  "):
+            m.init_config()
+        self.assertFalse(m.CONFIG_NAME.exists(), "空账号不应写出配置文件")
 
     def test_broken_json_exits(self):
         self._write("{not json")

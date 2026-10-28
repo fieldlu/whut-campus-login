@@ -378,6 +378,25 @@ class IspClient:
 
 # ---------------------------------------------------------------- 配置与主流程
 
+def _decode_secret(value) -> str:
+    """凭据字段解码。
+
+    `{B}` 前缀表示该字段是 base64 编码（只避免明文直读，**不是加密**）。
+    未带前缀则原样返回，兼容旧格式。
+    """
+    v = str(value or "")
+    if not v.startswith("{B}"):
+        return v
+    try:
+        return base64.b64decode(v[3:]).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as e:
+        raise ValueError(f"base64 字段无法解码：{e}") from e
+
+
+def _encode_secret(value: str) -> str:
+    return "{B}" + base64.b64encode(value.encode("utf-8")).decode()
+
+
 def load_credentials() -> tuple[str, str]:
     if CONFIG_NAME.exists():
         try:
@@ -388,13 +407,12 @@ def load_credentials() -> tuple[str, str]:
         if not isinstance(d, dict):
             log.error("凭据文件格式错误（应为 JSON 对象）：%s", CONFIG_NAME)
             sys.exit(1)
-        user, pwd = str(d.get("username", "")), str(d.get("password", ""))
-        if pwd.startswith("{B}"):
-            try:
-                pwd = base64.b64decode(pwd[3:]).decode("utf-8")
-            except (ValueError, UnicodeDecodeError) as e:
-                log.error("凭据文件里的 base64 密码无法解码：%s", e)
-                sys.exit(1)
+        try:
+            user = _decode_secret(d.get("username", ""))
+            pwd = _decode_secret(d.get("password", ""))
+        except ValueError as e:
+            log.error("凭据文件字段无法解码：%s\n请删除后重新运行 --init-config", e)
+            sys.exit(1)
         if user and pwd:
             return user, pwd
     log.error("缺少凭据：请先运行 --init-config 生成 %s", CONFIG_NAME)
@@ -411,10 +429,13 @@ def init_config() -> None:
         print("密码不能为空，已取消")
         return
     CONFIG_NAME.write_text(
-        json.dumps({"username": user, "password": pwd}, ensure_ascii=False, indent=2),
+        json.dumps(
+            {"username": _encode_secret(user), "password": _encode_secret(pwd)},
+            ensure_ascii=False, indent=2,
+        ),
         encoding="utf-8",
     )
-    print(f"已写入 {CONFIG_NAME}（注意：明文保存，勿提交到仓库）")
+    print(f"已写入 {CONFIG_NAME}（账号与密码已 base64 编码，非明文；仍勿提交到仓库）")
 
 
 def login_once(net: str, user: str, pwd: str) -> bool:

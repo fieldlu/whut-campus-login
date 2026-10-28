@@ -15,7 +15,7 @@
 - **防误判**：在线判定失败后二次确认（等 3 秒重试），避免瞬时抖动触发登录把已有会话顶掉
 - **保活模式**：`--watch` 定时检测，掉线自动重连
 - **绕过系统代理**：未认证时绝不会把登录请求送进 Clash 类代理（`trust_env = False`）
-- **凭据与代码分离**：账号密码只放在 `config.json`，已写入 `.gitignore`
+- **凭据与代码分离**：账号密码只放在 `config.json`（已写入 `.gitignore`），且以 `{B}` + base64 编码存储，不落明文
 - **零重依赖**：仅需 `requests`
 
 ## 快速开始
@@ -23,7 +23,7 @@
 ```bash
 pip install -r requirements.txt
 
-# 1) 生成凭据文件（交互输入，明文保存在本地 config.json）
+# 1) 生成凭据文件（交互输入，写入本地 config.json；字段做 base64 编码，非明文）
 python whut_login.py --init-config
 
 # 2) 检查当前联网状态
@@ -78,8 +78,10 @@ python whut_login.py --net isp     # 强制走 WHUT-ISP srun 门户
 **Q：为什么脚本要禁用系统代理？**
 认证门户都在内网地址上，走代理必然失败；而门户未认证时会劫持 HTTP 请求，走代理则会绕过劫持，导致拿不到 `nasId`。
 
-**Q：密码明文存在 `config.json` 安全吗？**
-文件不入库、不随代码分发，但**并非加密**。若要收紧权限，Windows 下可执行：
+**Q：密码存在 `config.json` 安全吗？**
+文件不入库、不随代码分发；账号与密码字段以 `{B}` + base64 存储，**只是避免被一眼读出，不是加密**（base64 可逆）。
+仓库已默认 `.gitignore` 掉 `config.json`、`python.local.txt`、`watch.lock` 等本地文件，提交前可用 `git status` 确认。
+若要收紧权限，Windows 下可执行：
 
 ```powershell
 icacls config.json /inheritance:r /grant:r "$env:USERNAME:(R,W)"
@@ -87,6 +89,10 @@ icacls config.json /inheritance:r /grant:r "$env:USERNAME:(R,W)"
 
 **Q：双击运行 / 开机自启？**
 仓库自带 `run_keepalive.bat`：双击即进入保活。看门狗只在**崩溃（非 0 退出码）**时重启，正常退出或被单实例锁拒绝（退出码 0）会直接结束，不会空转。把它的快捷方式放进 `shell:startup` 即可开机自启。
+
+**Q：机器上有多个 Python，启动器会用哪个？**
+按顺序查找：`python.local.txt`（放在脚本同目录，一行写 `python.exe` 全路径，**已被 git 忽略**）→ PATH 里的 `python` → `py -3`。
+选定后会先检查 `requests` 是否可用，缺失就明确提示而不是反复崩溃。之所以留这个本地文件，是为了让仓库里不出现任何人的本机路径。
 
 **Q：能不能同时开好几个保活？**
 不能，也不必要。保活模式启动时会对 `watch.lock` 加排他锁，第二个进程会打印「检测到已有保活进程在运行」后直接退出——多开会让两边同时判定离线、互相把会话顶掉。
@@ -109,11 +115,13 @@ python test_whut_login.py          # 或 python -m unittest -v test_whut_login
 | WLAN 登录 | 握手异常、绝对前缀成功、绝对失败后回退同主机 `/api`、双候选都失败、`csrf` 嵌套在 `data`、登录响应非 dict、`code != 0`、config.js 取不到 |
 | ISP | 门户不可达直接跳过、ac_id=0 成功、两个 ac_id 都失败、密码 `{B}` 编码 |
 | 编排 | `--net` 三种取值、auto 的「WLAN 失败但实际在线」与「转 ISP」分支 |
-| 凭据 | 明文 / base64 / JSON 损坏 / 非对象 / 文件缺失 / 字段为空 |
+| 凭据 | 明文 / 仅密码 base64 / 账号密码双 base64 / 混合格式 / 末尾点号保留 / base64 损坏 / JSON 损坏 / 非对象 / 文件缺失 / 字段为空 |
 | 主流程 | `--check-only`、登录成败退出码、保活循环遇异常不退出并计数 |
 | 单实例 | 加解锁循环、第二进程被拒、被锁时 `--watch` 安静退出 |
 
 ## 变更记录
+
+- **2026-10-28（隐私加固）** `config.json` 的账号与密码字段统一改为 `{B}` + base64 存储，`--init-config` 同步改为编码写入；`run_keepalive.bat` 移除硬编码的本机解释器路径，改为 `python.local.txt` → PATH → `py -3` 的三级查找（本地文件已 git 忽略），并新增 `requests` 依赖预检；测试增至 52 项。
 
 - **2026-10-28** 修复 WLAN 登录必然失败：`config.js` 的 `host_url` 是绝对地址，原代码按前缀拼接得到非法主机名；改为 `_api_url()` 并增加同主机 `/api` 兜底。同时补齐 6 处健壮性缺陷（握手异常未捕获、登录响应非 dict、`get_host_ip` 变量未绑定、凭据文件损坏、空输入、死常量），新增保活单实例锁与 46 个离线回归用例。
 - **2026-10-27** 修复 `_fetch_portal` 把字符串当 `urlparse` 结果取 `.netloc` 导致的崩溃；保活循环加异常兜底，单次失败不再终止进程。
