@@ -34,6 +34,7 @@ import argparse
 import base64
 import json
 import logging
+import os
 import re
 import socket
 import subprocess
@@ -55,7 +56,6 @@ REDIRECT_SEEDS = [                               # 触发门户重定向的种�
     "http://www.qq.com/",
 ]
 
-WLAN_PORTAL_HINT = "tpl/whut"                    # WLAN 门户页面特征
 ISP_HOST = "172.30.16.34"                       # srun 门户
 ISP_PORT = 80
 ISP_PORTAL = "http://172.30.16.34"              # srun 门户
@@ -69,6 +69,7 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 CONFIG_NAME = Path(__file__).resolve().parent / "config.json"
+LOCK_NAME = CONFIG_NAME.parent / "watch.lock"
 
 
 # ---------------------------------------------------------------- 工具
@@ -106,7 +107,55 @@ def is_online_sure() -> bool:
     return is_online()
 
 
+_LOCK_FH = None
+
+
+def acquire_watch_lock():
+    """保活模式单实例锁：避免多开导致互相顶号。
+
+    用文件排他锁实现，进程退出（含崩溃）时由系统自动释放，不会留死锁。
+    Windows 走 msvcrt；其它平台若不可用则放行（退化为无锁）。
+    """
+    global _LOCK_FH
+    try:
+        _LOCK_FH = open(LOCK_NAME, "a+")
+    except OSError as e:
+        log.warning("无法创建锁文件 %s（%s），跳过单实例检查", LOCK_NAME, e)
+        return True
+    try:
+        import msvcrt
+        _LOCK_FH.seek(0)
+        msvcrt.locking(_LOCK_FH.fileno(), msvcrt.LK_NBLCK, 1)
+        _LOCK_FH.seek(0)
+        _LOCK_FH.truncate()
+        _LOCK_FH.write(str(os.getpid()))
+        _LOCK_FH.flush()
+        return True
+    except ImportError:
+        return True                      # 非 Windows：不加锁
+    except OSError:
+        return False                     # 已被其它进程占用
+
+
+def release_watch_lock() -> None:
+    global _LOCK_FH
+    if _LOCK_FH is None:
+        return
+    try:
+        import msvcrt
+        _LOCK_FH.seek(0)
+        msvcrt.locking(_LOCK_FH.fileno(), msvcrt.LK_UNLCK, 1)
+    except Exception:
+        pass
+    try:
+        _LOCK_FH.close()
+    except Exception:
+        pass
+    _LOCK_FH = None
+
+
 def get_host_ip() -> str:
+    s = None
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -114,7 +163,8 @@ def get_host_ip() -> str:
     except OSError:
         return "127.0.0.1"
     finally:
-        s.close()
+        if s is not None:
+            s.close()
 
 
 def get_mac_address() -> str:
@@ -188,8 +238,12 @@ class WlanClient:
         s, host = self.session, self.host
         base = f"http://{host}"
 
-        # 1) 握手拿 cookie
-        s.get(f"{base}/tpl/whut/login.html?nasId={self.nas_id}", timeout=self.timeout)
+        # 1) 握手拿 cookie（门户可能拒连，失败应当作普通失败返回而不是抛异常）
+        try:
+            s.get(f"{base}/tpl/whut/login.html?nasId={self.nas_id}", timeout=self.timeout)
+        except requests.RequestException as e:
+            log.warning("WLAN 门户握手失败: %s", e)
+            return False
 
         # 2) 从 config.js 解析 API 前缀
         api_base = ""
@@ -257,12 +311,15 @@ class WlanClient:
         except (requests.RequestException, ValueError) as e:
             log.error("WLAN 登录请求异常: %s", e)
             return False
-        if body.get("code") == 0:
+        if isinstance(body, dict) and body.get("code") == 0:
             info = body.get("online") or {}
             log.info("WHUT-WLAN 登录成功 | 用户 %s | IP %s | 本机 %s",
                      info.get("Username", self.username), info.get("UserIpv4", "?"), get_host_ip())
             return True
-        log.error("WLAN 登录失败: code=%s msg=%s", body.get("code"), body.get("msg"))
+        if isinstance(body, dict):
+            log.error("WLAN 登录失败: code=%s msg=%s", body.get("code"), body.get("msg"))
+        else:
+            log.error("WLAN 登录响应非 JSON 对象: %s", str(body)[:120])
         return False
 
 
@@ -323,10 +380,21 @@ class IspClient:
 
 def load_credentials() -> tuple[str, str]:
     if CONFIG_NAME.exists():
-        d = json.loads(CONFIG_NAME.read_text(encoding="utf-8"))
-        user, pwd = d.get("username", ""), d.get("password", "")
+        try:
+            d = json.loads(CONFIG_NAME.read_text(encoding="utf-8"))
+        except (ValueError, OSError) as e:
+            log.error("凭据文件无法解析（%s）：%s\n请删除后重新运行 --init-config", CONFIG_NAME, e)
+            sys.exit(1)
+        if not isinstance(d, dict):
+            log.error("凭据文件格式错误（应为 JSON 对象）：%s", CONFIG_NAME)
+            sys.exit(1)
+        user, pwd = str(d.get("username", "")), str(d.get("password", ""))
         if pwd.startswith("{B}"):
-            pwd = base64.b64decode(pwd[3:]).decode("utf-8")
+            try:
+                pwd = base64.b64decode(pwd[3:]).decode("utf-8")
+            except (ValueError, UnicodeDecodeError) as e:
+                log.error("凭据文件里的 base64 密码无法解码：%s", e)
+                sys.exit(1)
         if user and pwd:
             return user, pwd
     log.error("缺少凭据：请先运行 --init-config 生成 %s", CONFIG_NAME)
@@ -335,7 +403,13 @@ def load_credentials() -> tuple[str, str]:
 
 def init_config() -> None:
     user = input("校园网账号(学号/工号): ").strip()
+    if not user:
+        print("账号不能为空，已取消")
+        return
     pwd = input("密码: ").strip()
+    if not pwd:
+        print("密码不能为空，已取消")
+        return
     CONFIG_NAME.write_text(
         json.dumps({"username": user, "password": pwd}, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -383,8 +457,12 @@ def main() -> int:
     user, pwd = load_credentials()
 
     if args.watch:
+        if not acquire_watch_lock():
+            log.error("检测到已有保活进程在运行（%s 被占用），本次退出。\n"
+                      "如需重建，请先关闭原来的窗口。", LOCK_NAME)
+            return 0
         interval = max(30, args.watch)
-        log.info("保活模式启动，检测间隔 %ss（Ctrl+C 退出）", interval)
+        log.info("保活模式启动，检测间隔 %ss，PID %d（Ctrl+C 退出）", interval, os.getpid())
         fail_streak = 0
         while True:
             try:
@@ -422,6 +500,7 @@ if __name__ == "__main__":
         sys.exit(main())
     except KeyboardInterrupt:
         log.info("已停止")
+        release_watch_lock()
         sys.exit(130)
     except Exception as e:                               # noqa: BLE001
         log.error("未捕获异常：%s: %s", type(e).__name__, e)
