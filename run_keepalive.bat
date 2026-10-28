@@ -5,7 +5,9 @@ cd /d "%~dp0"
 
 rem ============================================================
 rem  WHUT campus network keep-alive launcher (watchdog)
-rem  Restarts whut_login.py automatically whenever it exits.
+rem  Restarts whut_login.py only when it CRASHES.
+rem  Normal exit (0) or user stop (130) ends the watchdog,
+rem  so a refused second instance will not loop forever.
 rem  Edit PYTHON below if your interpreter path differs.
 rem ============================================================
 
@@ -26,6 +28,24 @@ title WHUT KeepAlive - watchdog
 echo.
 echo [%date% %time%] starting whut_login.py --watch %INTERVAL%
 "%PYTHON%" whut_login.py --watch %INTERVAL%
-echo [%date% %time%] exited with code %errorlevel%, restarting in %RETRY_WAIT%s ...
+set "RC=%errorlevel%"
+
+if "%RC%"=="0" (
+    echo [%date% %time%] exited normally ^(code 0^), watchdog stops.
+    echo   hint: if it said "already running", close the other window instead.
+    goto :done
+)
+if "%RC%"=="130" (
+    echo [%date% %time%] stopped by user ^(Ctrl+C^), watchdog stops.
+    goto :done
+)
+
+echo [%date% %time%] crashed with code %RC%, restarting in %RETRY_WAIT%s ...
 "%SystemRoot%\System32\ping.exe" -n %RETRY_WAIT% 127.0.0.1 >nul
 goto loop
+
+:done
+echo.
+echo Watchdog finished. You can close this window.
+pause >nul
+endlocal

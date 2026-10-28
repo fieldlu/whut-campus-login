@@ -7,3 +7,4 @@ venv/
 .DS_Store
 Thumbs.db
 *.log
+watch.lock
