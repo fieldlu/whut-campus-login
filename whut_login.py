@@ -56,7 +56,9 @@ REDIRECT_SEEDS = [                               # 触发门户重定向的种�
 ]
 
 WLAN_PORTAL_HINT = "tpl/whut"                    # WLAN 门户页面特征
-ISP_PORTAL = "http://172.30.16.34"               # srun 门户
+ISP_HOST = "172.30.16.34"                       # srun 门户
+ISP_PORT = 80
+ISP_PORTAL = "http://172.30.16.34"              # srun 门户
 ISP_AUTH_PATH = "/include/auth_action.php"
 ISP_REFERER = ISP_PORTAL + "/srun_portal_pc.php?ac_id=5&url=1.1.1.1"
 ISP_AC_IDS = (0, 5)
@@ -77,6 +79,15 @@ def new_session() -> requests.Session:
     s.trust_env = False
     s.headers["User-Agent"] = USER_AGENT
     return s
+
+
+def _tcp_open(host: str, port: int, timeout: float = 1.5) -> bool:
+    """快速 TCP 探活，用于判断某个门户在当前网段是否可达。"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 def is_online(timeout: float = 4.0) -> bool:
@@ -137,6 +148,20 @@ class WlanClient:
         self.host = ""
         self.nas_id = ""
 
+    @staticmethod
+    def _api_url(base: str, prefix: str, path: str) -> str:
+        """拼 API 地址：config.js 的 host_url 可能是绝对地址(http://x/api)，
+        也可能是相对路径(/api 或 api)，两种都要正确处理，避免拼出
+        "http://172.30.21.100http://192.168.85.20/api" 这类非法主机名。"""
+        p = (prefix or "").strip().rstrip("/")
+        if not p:
+            return base + path
+        if p.startswith(("http://", "https://")):
+            return p + path
+        if not p.startswith("/"):
+            p = "/" + p
+        return base + p + path
+
     def _fetch_portal(self) -> bool:
         """跟随 HTTP 重定向拿到门户 host 与 nasId。"""
         for seed in REDIRECT_SEEDS:
@@ -178,16 +203,31 @@ class WlanClient:
         api_base = api_base or "/api"
         log.info("WLAN API 前缀: %s", api_base)
 
-        # 3) CSRF 令牌
-        csrf = ""
-        try:
-            r = s.get(
-                f"{base}{api_base}/csrf-token", timeout=self.timeout,
-                headers={"Referer": f"{base}/tpl/whut/login.html?nasId={self.nas_id}"},
-            )
-            csrf = r.json().get("csrf_token", "")
-        except (requests.RequestException, ValueError) as e:
-            log.warning("获取 CSRF 失败: %s", e)
+        # 3) CSRF 令牌：先用 config.js 给的前缀，失败再退回同主机 /api
+        candidates = [c for c in (api_base, "/api") if c]
+        if len(candidates) == 2 and candidates[0].rstrip("/") == "/api":
+            candidates = candidates[:1]
+        csrf, api_used = "", ""
+        for pref in candidates:
+            url = self._api_url(base, pref, "/csrf-token")
+            try:
+                r = s.get(url, timeout=self.timeout,
+                         headers={"Referer": f"{base}/tpl/whut/login.html?nasId={self.nas_id}"})
+                payload = r.json()
+            except (requests.RequestException, ValueError) as e:
+                log.warning("获取 CSRF 失败（%s）: %s", url, e)
+                continue
+            token = ""
+            if isinstance(payload, dict):
+                token = payload.get("csrf_token") or payload.get("token") or ""
+                inner = payload.get("data")
+                if not token and isinstance(inner, dict):
+                    token = inner.get("csrf_token") or inner.get("token") or ""
+            if token:
+                csrf, api_used = token, pref
+                log.info("CSRF 获取成功 | API 前缀: %s", pref)
+                break
+            log.warning("CSRF 响应无令牌（%s）: %s", url, str(payload)[:120])
         if not csrf:
             log.error("CSRF 令牌为空，WLAN 登录中止")
             return False
@@ -211,7 +251,7 @@ class WlanClient:
             "Content-Type": "application/x-www-form-urlencoded",
         }
         try:
-            r = s.post(f"{base}{api_base}/account/login", data=data,
+            r = s.post(self._api_url(base, api_used, "/account/login"), data=data,
                        headers=headers, timeout=self.timeout)
             body = r.json()
         except (requests.RequestException, ValueError) as e:
@@ -268,6 +308,11 @@ class IspClient:
         return False
 
     def login(self) -> bool:
+        # 先探一下门户端口：在 WHUT-WLAN 段内 172.30.16.34 通常不可达，
+        # 直接跳过可省掉两次 3s 超时和满屏连接异常。
+        if not _tcp_open(ISP_HOST, ISP_PORT, timeout=1.5):
+            log.info("WHUT-ISP 门户不可达（当前可能不在宿舍网），跳过")
+            return False
         for ac_id in ISP_AC_IDS:
             if self._try_ac(ac_id):
                 return True
